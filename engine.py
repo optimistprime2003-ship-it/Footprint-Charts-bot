@@ -41,49 +41,78 @@ class OrderFlowEngine:
         return round(float(price) / TICK_SIZE) * TICK_SIZE
 
     async def process_trade(self, trade, client):
-        price = float(trade['p'])
-        qty = float(trade['q'])
-        is_buyer_maker = trade['m'] # True = Sell (Market hit Bid), False = Buy (Market hit Ask)
-        tick = self.get_tick_price(price)
+        try:
+            price = float(trade['p'])
+            qty = float(trade['q'])
+            is_buyer_maker = trade['m'] # True = Sell (Market hit Bid), False = Buy (Market hit Ask)
+            tick = self.get_tick_price(price)
 
-        # 1. Update Price Ladder
-        if tick not in self.price_ladder:
-            self.price_ladder[tick] = {'bid': 0, 'ask': 0}
-        
-        if is_buyer_maker:
-            self.price_ladder[tick]['bid'] += qty
-            self.cumulative_delta -= qty
-        else:
-            self.price_ladder[tick]['ask'] += qty
-            self.cumulative_delta += qty
+            # 1. Update Price Ladder
+            if tick not in self.price_ladder:
+                self.price_ladder[tick] = {'bid': 0, 'ask': 0}
 
-        # 2. Check for Trapped Traders (Point 2: Delta Divergence)
-        if price > self.high_4h and self.cumulative_delta < 0:
-            logging.warning(f"TRAP: Price above 4H High but Delta is Negative ({self.cumulative_delta})")
-            # Logic: Potential Fakeout - Consider Sell
+            if is_buyer_maker:
+                self.price_ladder[tick]['bid'] += qty
+                self.cumulative_delta -= qty
+            else:
+                self.price_ladder[tick]['ask'] += qty
+                self.cumulative_delta += qty
 
-        # 3. Check for Stacked Imbalances (Point 3)
-        await self.check_imbalances(tick, price, client)
-        self.last_price = price
+            # Prune ladder to keep memory usage low (keep only levels within 5% of current price)
+            if len(self.price_ladder) > 1000:
+                self.price_ladder = {k: v for k, v in self.price_ladder.items() if abs(k - price) / price < 0.05}
+
+            # 2. Check for Trapped Traders (Point 2: Delta Divergence)
+            if self.high_4h and price > self.high_4h and self.cumulative_delta < 0:
+                logging.warning(f"TRAP: Price above 4H High but Delta is Negative ({self.cumulative_delta})")
+                # Logic: Potential Fakeout - Consider Sell
+
+            # 3. Check for Stacked Imbalances (Point 3)
+            await self.check_imbalances(tick, price, client)
+            self.last_price = price
+        except Exception as e:
+            logging.error(f"Error processing trade: {e}")
 
     async def check_imbalances(self, current_tick, current_price, client):
-        # Diagonal check: Ask at current vs Bid at price below
-        prices = sorted(self.price_ladder.keys(), reverse=True)
-        stacks = 0
+        # Diagonal check:
+        # Bullish: Ask at level N > 3x Bid at level N-1
+        # Bearish: Bid at level N > 3x Ask at level N+1
         
+        prices = sorted(self.price_ladder.keys(), reverse=True)
+        if len(prices) < STACK_REQUIRED + 1:
+            return
+
+        # Check Bullish Imbalances
+        bull_stacks = 0
         for i in range(len(prices) - 1):
             ask_vol = self.price_ladder[prices[i]]['ask']
             bid_vol_below = self.price_ladder[prices[i+1]]['bid']
             
             if bid_vol_below > 0 and ask_vol > (bid_vol_below * IMBALANCE_RATIO):
-                stacks += 1
+                bull_stacks += 1
             else:
-                stacks = 0 # Must be consecutive
+                bull_stacks = 0
             
-            if stacks >= STACK_REQUIRED:
+            if bull_stacks >= STACK_REQUIRED:
                 logging.info(f"BULLISH STACKED IMBALANCE at {prices[i]}")
                 await self.execute_trade("BUY", current_price, client)
-                break
+                return # Avoid multiple triggers per trade
+
+        # Check Bearish Imbalances
+        bear_stacks = 0
+        for i in range(1, len(prices)):
+            bid_vol = self.price_ladder[prices[i]]['bid']
+            ask_vol_above = self.price_ladder[prices[i-1]]['ask']
+
+            if ask_vol_above > 0 and bid_vol > (ask_vol_above * IMBALANCE_RATIO):
+                bear_stacks += 1
+            else:
+                bear_stacks = 0
+
+            if bear_stacks >= STACK_REQUIRED:
+                logging.info(f"BEARISH STACKED IMBALANCE at {prices[i]}")
+                await self.execute_trade("SELL", current_price, client)
+                return
 
     async def execute_trade(self, side, price, client):
         # Calculate Position Size: $1.00 risk / 100 point Stop Loss
